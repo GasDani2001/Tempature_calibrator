@@ -18,10 +18,13 @@ class Temp_calibration():
         #button init
         self.button = Pin(18, Pin.IN, Pin.PULL_UP)
         self.button.irq(trigger=Pin.IRQ_FALLING, handler=self.stop_signal)
-        self.stop_event = asyncio.Event()
+
         self.button_pressed = False
-        self.running = False
+        self.button_pending = False
         self.last_interrupt_time = 0
+
+        self.paused = False
+        self.saved_position = 0
         
         #Led init
         self.led = Pin(5, Pin.OUT)
@@ -82,7 +85,11 @@ class Temp_calibration():
         await asyncio.sleep(0.05)
         self.counter -= start_counter
         
-        await asyncio.sleep(5)    # ez majd 10 perc lesz, de tesztelés alatt pár másodperc marad.
+        val = self.adc.read()
+        if val < 1900:   # áramkimaradás esetén a program nem vár
+            pass
+        else:
+            await asyncio.sleep(5*60)    # indítástól száítva 5 percig nincs csükség mintavételezésre
 
 
     def max_limit(self):         # a motor max beállítását intézi
@@ -151,7 +158,16 @@ class Temp_calibration():
         val_check = val
         
         self.running = True
+        
+        # Gombkezelő és LED vezérlés elindítása
+        button_handler = asyncio.create_task(self.button_task())
+        
         while self.running:
+            
+            # Ha szüneteltetve van a rendszer, nem végzünk hőszabályozást.
+            if self.paused:
+                await asyncio.sleep(0.1)
+                continue
 
             val = self.adc.read()     # 0–4095
             diff = val - val_check       # a mérési különbséget számolja ki, így tudjuk, hogy melegedett-e a rendster vagy hűlt-e
@@ -165,7 +181,7 @@ class Temp_calibration():
                 print("motor minimuzmra állítása, túlmelegedés elkerülése.")
                 await self.soft_stop()      # power = MIN
 
-            elif val < 1180:     # 80 °C                              
+            if val < 1180:     # 80 °C                              
                 await self.cooling_calibration(agressive_move_sum, diff)    # ha tovább melegedik, állítok
                             
             elif val < 1350:     # 75 °C    
@@ -187,18 +203,22 @@ class Temp_calibration():
             val_check = val
             print(f"ADC: {val} | Diff: {diff} | Pos: {self.counter}/{self.max_engine_count}")           
             for _ in range(10*60*self.wait_time):
-                if not self.running or self.stop_event.is_set():
-                    break # Ha megnyomták a gombot, azonnal kilépünk a kis ciklusból
-                
-                await asyncio.sleep(0.1) # Átadjuk a vezérlést az ütemezőnek
-                        
-            # Ha a gombnyomás miatt léptünk ki a fenti for ciklusból:
-            if not self.running or self.stop_event.is_set():
-                print("Esemény: Azonnali leállás észlelve!")
-                break # Kilépünk a fő while hurokból is
+
+                if not self.running:
+                    break
+
+                if self.paused:
+                    break
+
+                await asyncio.sleep(0.1)
                 
         print("Indul a leállási protokoll...")
-        utime.sleep_ms(50)
+        self.running = False
+
+        button_handler.cancel()
+
+        await asyncio.sleep(0.05)
+
         await self.emergency_mode()
     
     async def max_engine(self):    # Max motorállás
@@ -222,20 +242,74 @@ class Temp_calibration():
         
     def stop_signal(self, pin):
         # Várunk egy picit, hogy a "zaj" lecsengjen
-        utime.sleep_ms(50)
+        current_time = utime.ticks_ms()
+
+        if utime.ticks_diff(current_time, self.last_interrupt_time) > 300:
+            self.button_pending = True
+            self.last_interrupt_time = current_time
         
-        if pin.value() == 0:
-            current_time = utime.ticks_ms()
-            if utime.ticks_diff(current_time, self.last_interrupt_time) > 300:    # Gombnyomásra leállás
-                if self.button_pressed == False:
-                    self.running = False
-                    self.stop_event.set()
-                    self.last_interrupt_time = current_time
+    async def toggle_pause(self):
+
+        if not self.paused:
+
+            self.saved_position = self.counter
+            self.paused = True
+
+            print("Szüneteltetés:", self.saved_position)
+
+            await self.close_dir(self.saved_position)
+
+            self.counter = 0
+
+        else:
+
+            print("Folytatás:", self.saved_position)
+
+            await self.open_dir(self.saved_position)
+
+            self.counter = self.saved_position
+            self.paused = False
+
+
+    async def button_task(self):
+
+        blink_counter = 0
+
+        while self.running:
+
+            if self.button_pending:
+
+                self.button_pending = False
+
+                # 50 ms aszinkron pergésmentesítés
+                await asyncio.sleep(0.05)
+
+                # Csak valódi, stabil lenyomást fogadunk el
+                if self.button.value() == 0 and not self.button_pressed:
+
                     self.button_pressed = True
-                    print("Validált leállítás!")
+
+                    await self.toggle_pause()
+
+            # Gomb felengedése
+            if self.button.value() == 1:
+                self.button_pressed = False
+
+            # LED vezérlés
+            if self.paused:
+
+                blink_counter += 1
+
+                if blink_counter >= 10:
+                    self.led.toggle()
+                    blink_counter = 0
+
             else:
-                #Szellemnyomás
-                pass
+                self.led.value(1)
+                blink_counter = 0
+
+            await asyncio.sleep(0.05)
+
 
 
 if __name__ == "__main__":
